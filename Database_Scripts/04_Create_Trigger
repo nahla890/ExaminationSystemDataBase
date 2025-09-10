@@ -1,0 +1,143 @@
+-- Trigger: Prevent exam before time
+create trigger TR_PreventEarlyExamAccess
+on Exams.Stud_Exam
+instead of insert
+as
+begin
+    declare @ExamID int, @StudID int;
+    select @ExamID = ExamID, @StudID = StudID from inserted;
+
+    if exists (select 1 from Exams.Exam 
+               where ExamID = @ExamID 
+               and (ExamDate > cast(getdate() as date)
+               or (ExamDate = cast(getdate() as date) and StartTime > cast(getdate() as time))))
+    begin
+        raiserror('Cannot access exam before scheduled time.',16,1);
+        rollback transaction;
+    end
+    else
+    begin
+        insert into Exams.Stud_Exam (StudID, ExamID, [Type], Total_Mark)
+        select StudID, ExamID, [Type], Total_Mark from inserted;
+    end
+end;
+go
+
+--2 Trigger: Auto mark MCQ/TrueFalse
+create TRIGGER TR_AutoMarkMCQ
+ON Exams.Answer
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE a
+    SET isCorrect = CASE 
+        -- MCQ & T/F
+        WHEN q.[Type] IN ('MCQ','T/F') 
+             AND q.CorrectAnswer IS NOT NULL
+             AND LTRIM(RTRIM(a.Answer)) = LTRIM(RTRIM(q.CorrectAnswer))
+        THEN 'True'
+
+        -- Text Questions: match exact CorrectAnswer
+        WHEN q.[Type] = 'Text'
+             AND q.CorrectAnswer IS NOT NULL
+             AND LTRIM(RTRIM(a.Answer)) = LTRIM(RTRIM(q.CorrectAnswer))
+        THEN 'True'
+
+        -- Text Questions: BestAnswer contains Answer
+        WHEN q.[Type] = 'Text'
+             AND q.BestAnswer IS NOT NULL
+             AND q.BestAnswer LIKE '%' + LTRIM(RTRIM(a.Answer)) + '%'
+        THEN 'True'
+
+        ELSE 'False'
+    END
+    FROM Exams.Answer a
+    JOIN inserted i 
+        ON a.StdID = i.StdID 
+       AND a.ExamID = i.ExamID 
+       AND a.QuestionNO = i.QuestionNO
+    JOIN Exams.Question q 
+        ON a.QuestionNO = q.QuestionNO;
+END;
+GO
+
+go
+
+
+--3 TR_ExamDegreeCheck
+CREATE TRIGGER TR_ExamDegreeCheck
+ON Exams.Exam_Question
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    DECLARE @CourseID INT, @ExamID INT, @Total INT, @Max INT;
+
+    SELECT @ExamID = ExamID FROM inserted;
+    SELECT @CourseID = CourseID FROM Exams.Exam WHERE ExamID = @ExamID;
+
+    SELECT @Total = SUM(Mark) FROM Exams.Exam_Question WHERE ExamID = @ExamID;
+    SELECT @Max = [dbo].[fn_GetCourseMaxDegree] (@CourseID);
+
+    IF (@Total > @Max)
+    BEGIN
+        RAISERROR('Total degrees exceed course max degree!', 16, 1);
+        ROLLBACK TRANSACTION;
+    END
+END;
+
+go
+--4 TR_PreventDeleteAnsweredQuestion
+CREATE TRIGGER TR_PreventDeleteAnsweredQuestion
+ON Exams.Question
+INSTEAD OF DELETE
+AS
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM Exams.Answer A
+        JOIN deleted D ON A.QuestionNO = D.QuestionNO
+    )
+    BEGIN
+        RAISERROR('Cannot delete question already answered by students.', 16, 1);
+        RETURN;
+    END
+    DELETE FROM Exams.Question WHERE QuestionNO IN (SELECT QuestionNO FROM deleted);
+END;
+go
+--5 TR_NoDuplicateUserName
+
+CREATE TRIGGER TR_NoDuplicateUserName
+ON Person.[User]
+INSTEAD OF INSERT
+AS
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM Person.[User] U
+        JOIN inserted I ON U.Username = I.Username
+    )
+    BEGIN
+        RAISERROR('Username already exists.', 16, 1);
+        ROLLBACK TRANSACTION;
+    END
+    INSERT INTO Person.[User] (Username, [Password], Name, Email, Phone, Role, Age)
+    SELECT Username, [Password], Name, Email, Phone, Role, Age FROM inserted;
+END;
+go
+--6 TR_CourseInstructorUnique
+CREATE TRIGGER TR_CourseInstructorUnique
+ON Courses.InstructorTeachCourse
+INSTEAD OF INSERT
+AS
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM Courses.InstructorTeachCourse ITC
+        JOIN inserted I ON ITC.CourseID = I.CourseID AND ITC.InstructorID = I.InstructorID AND ITC.TeachYear = I.TeachYear
+    )
+    BEGIN
+        RAISERROR('Instructor already assigned to this course in the same year.', 16, 1);
+        ROLLBACK TRANSACTION;
+    END
+    INSERT INTO Courses.InstructorTeachCourse (InstructorID, CourseID, TeachYear)
+    SELECT InstructorID, CourseID, TeachYear FROM inserted;
+END;
